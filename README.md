@@ -1,149 +1,172 @@
-# ☸️ Kubernetes End-to-End Project on AWS EKS
+# Kubernetes End-to-End Deployment on AWS EKS
 
-> A hands-on DevOps project deploying a containerized application on AWS Elastic Kubernetes Service (EKS) — from cluster setup to live traffic routing.
-
----
-
-## 📌 Project Overview
-
-This project demonstrates a complete Kubernetes workflow on **AWS EKS**, covering everything from cluster architecture to exposing an application via an AWS Application Load Balancer (ALB). Built as part of real-world DevOps practice to bridge the gap between theoretical Kubernetes knowledge and cloud-based implementation.
+> Containerized application deployed on AWS Elastic Kubernetes Service with ALB-based external traffic routing, namespace isolation, and rolling update strategy.
 
 ---
 
-## 🎯 What I Worked On
+## Overview
 
-| Area | Details |
-|------|---------|
-| **EKS Cluster Architecture** | Understood node groups, control plane, and worker node communication |
-| **Containerized App Deployment** | Deployed a Dockerized application onto the Kubernetes cluster |
-| **Kubernetes Resources** | Created and managed `Deployment`, `Service`, and `Ingress` resources |
-| **AWS ALB Ingress** | Exposed the application externally using the AWS Load Balancer Controller |
-| **Networking & Traffic Flow** | Observed how traffic flows through EKS — from the internet to pods |
+This project covers a full Kubernetes deployment lifecycle on AWS EKS — from cluster provisioning and IAM configuration to exposing a containerized application via an AWS Application Load Balancer. The focus was on understanding how Kubernetes primitives (Deployment, Service, Ingress) map to real AWS infrastructure, and working through the operational gaps that don't show up in tutorials.
 
 ---
 
-## 🏗️ Architecture
+## Tech Stack
+
+| Component | Detail |
+|-----------|--------|
+| Cloud | AWS (EKS, ALB, IAM, EC2 Node Groups) |
+| Kubernetes | Amazon EKS — managed control plane |
+| Ingress Controller | AWS Load Balancer Controller (ALB) |
+| Containerization | Docker |
+| K8s Resources | Deployment, Service (ClusterIP), Ingress |
+| CLI Tools | kubectl, eksctl, aws cli, helm |
+
+---
+
+## Architecture
+
+Traffic flows from the internet through an AWS ALB, which the Load Balancer Controller provisions automatically based on Ingress annotations. The ALB forwards requests to the Kubernetes Service, which load-balances across healthy pods managed by the Deployment controller.
 
 ```
-Internet
-   │
-   ▼
-AWS ALB (Application Load Balancer)
-   │
-   ▼
-Kubernetes Ingress
-   │
-   ▼
-Kubernetes Service (ClusterIP / NodePort)
-   │
-   ▼
-Kubernetes Pods (Deployment)
-   │
-   ▼
-Docker Container (Application)
+Internet → AWS ALB → Kubernetes Ingress → Service (ClusterIP) → Pods → Docker Container
+```
+
+### Key Design Decisions
+
+- **ClusterIP over NodePort** — ALB controller routes directly to pod IPs via IP target mode, avoiding extra hops through node ports
+- **Namespace isolation** — workloads separated by environment to scope RBAC and resource quotas
+- **Rolling update strategy** — configured on the Deployment to avoid downtime during redeployment
+- **Liveness and readiness probes** — defined per container so the ALB only routes to healthy pods
+
+---
+
+## Cluster Provisioning
+
+### 1. Create EKS Cluster
+
+Cluster created with `eksctl` using a managed node group of 2 x t3.medium workers in us-east-1:
+
+```bash
+eksctl create cluster \
+  --name my-cluster \
+  --region us-east-1 \
+  --nodegroup-name standard-workers \
+  --node-type t3.medium \
+  --nodes 2
+```
+
+Configure local kubectl context:
+
+```bash
+aws eks update-kubeconfig --name my-cluster --region us-east-1
+```
+
+### 2. Install AWS Load Balancer Controller
+
+The ALB controller requires an IAM OIDC provider and a service account with an IAM role before Helm installation:
+
+```bash
+# Associate OIDC provider with cluster
+eksctl utils associate-iam-oidc-provider --cluster my-cluster --approve
+
+# Create IAM service account
+eksctl create iamserviceaccount \
+  --cluster my-cluster \
+  --namespace kube-system \
+  --name aws-load-balancer-controller \
+  --attach-policy-arn arn:aws:iam::<ACCOUNT_ID>:policy/AWSLoadBalancerControllerIAMPolicy \
+  --approve
+
+# Install via Helm
+helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
+  -n kube-system \
+  --set clusterName=my-cluster \
+  --set serviceAccount.create=false \
+  --set serviceAccount.name=aws-load-balancer-controller
 ```
 
 ---
 
-## 🛠️ Tech Stack
-
-- **Cloud Provider:** AWS
-- **Kubernetes:** Amazon EKS (Elastic Kubernetes Service)
-- **Ingress Controller:** AWS Load Balancer Controller (ALB)
-- **Containerization:** Docker
-- **Kubernetes Resources:** Deployment, Service, Ingress
-- **CLI Tools:** `kubectl`, `eksctl`, `aws cli`
-
----
-
-## 📂 Key Kubernetes Resources
+## Application Deployment
 
 ### Deployment
-Manages the desired state of the application pods — ensuring the correct number of replicas are running at all times.
+
+Manages desired pod state with 2 replicas, rolling update strategy, and health probes:
+
+```bash
+kubectl apply -f deployment.yaml
+```
+
+Key config:
+
+- `replicas: 2` — two pods for redundancy
+- `strategy: RollingUpdate` — `maxUnavailable: 0`, `maxSurge: 1` ensures zero-downtime deploys
+- `readinessProbe` — HTTP GET on `/health`, 3s delay, 5s period; pod only receives traffic when ready
+- `livenessProbe` — same endpoint, 10s initial delay; restarts container if it becomes unresponsive
 
 ### Service
-Provides a stable internal endpoint to route traffic to the appropriate pods, abstracting away pod IP changes.
+
+ClusterIP Service provides a stable internal endpoint. The ALB controller uses pod IPs directly (`ip` target type), so ClusterIP is sufficient — no NodePort needed:
+
+```bash
+kubectl apply -f service.yaml
+```
 
 ### Ingress
-Defines routing rules for external HTTP/HTTPS traffic and integrates with AWS ALB to expose the application publicly.
+
+Ingress resource with ALB annotations triggers the controller to provision an internet-facing ALB in the correct subnets:
+
+```bash
+kubectl apply -f ingress.yaml
+```
+
+Critical annotations:
+
+- `kubernetes.io/ingress.class: alb` — tells the controller to handle this resource
+- `alb.ingress.kubernetes.io/scheme: internet-facing` — provisions a public ALB
+- `alb.ingress.kubernetes.io/target-type: ip` — routes to pod IPs, not node ports
 
 ---
 
-## 🚀 Getting Started
+## Verifying the Deployment
 
-### Prerequisites
+```bash
+# Check pods are Running and Ready
+kubectl get pods -n <namespace>
 
-- AWS Account with appropriate IAM permissions
-- `kubectl` installed
-- `eksctl` installed
-- `aws cli` configured
+# Confirm service endpoint
+kubectl get svc -n <namespace>
 
-### Steps
+# Get ALB DNS name from Ingress
+kubectl get ingress -n <namespace>
 
-1. **Create EKS Cluster**
-   ```bash
-   eksctl create cluster --name my-cluster --region us-east-1 --nodegroup-name standard-workers --node-type t3.medium --nodes 2
-   ```
-
-2. **Configure kubectl**
-   ```bash
-   aws eks update-kubeconfig --name my-cluster --region us-east-1
-   ```
-
-3. **Install AWS Load Balancer Controller**
-   ```bash
-   # Follow AWS documentation to install the ALB controller via Helm
-   helm install aws-load-balancer-controller eks/aws-load-balancer-controller -n kube-system
-   ```
-
-4. **Deploy the Application**
-   ```bash
-   kubectl apply -f deployment.yaml
-   kubectl apply -f service.yaml
-   kubectl apply -f ingress.yaml
-   ```
-
-5. **Verify Resources**
-   ```bash
-   kubectl get pods
-   kubectl get svc
-   kubectl get ingress
-   ```
+# Describe ingress for event log and ALB provisioning status
+kubectl describe ingress <ingress-name> -n <namespace>
+```
 
 ---
 
-## 📁 Repository
+## Issues Encountered & Fixed
 
-🔗 **GitHub:** [https://lnkd.in/daQxVPnuU](https://lnkd.in/daQxVPnuU)
-
----
-
-## 📚 Key Learnings
-
-- How AWS EKS manages the Kubernetes control plane on your behalf
-- The relationship between Pods, Deployments, Services, and Ingress
-- How the AWS ALB Ingress Controller provisions and manages load balancers automatically
-- How traffic flows from the internet → ALB → Ingress → Service → Pods
-- The importance of IAM roles, service accounts, and OIDC for EKS integrations
+| Issue | Root Cause & Fix |
+|-------|-----------------|
+| ALB not provisioning | Controller pod was not running — OIDC association was missing. Fixed by re-running `eksctl utils associate-iam-oidc-provider` before Helm install. |
+| Pods stuck in Pending | Node group didn't have enough capacity for the requested CPU. Lowered resource requests in Deployment spec. |
+| Readiness probe failing | App was taking ~8s to start but probe delay was set to 3s. Increased `initialDelaySeconds` to 10. |
+| Ingress address blank | Subnets weren't tagged with `kubernetes.io/role/elb=1`. Added tags and ALB provisioned within 2 minutes. |
 
 ---
 
-## 🌱 What's Next
+## Planned Improvements
 
-- [ ] Add Horizontal Pod Autoscaler (HPA)
-- [ ] Set up CI/CD pipeline with GitHub Actions
-- [ ] Implement monitoring with Prometheus & Grafana
-- [ ] Explore Helm charts for templated deployments
-- [ ] Configure SSL/TLS with AWS Certificate Manager (ACM)
-
----
-
-## 👤 Author
-
-Still learning, still building — and focusing on doing real work. 🚀
+- [ ] Add Horizontal Pod Autoscaler (HPA) based on CPU utilization
+- [ ] Configure SSL/TLS termination at the ALB using AWS Certificate Manager
+- [ ] Set up Prometheus + Grafana for pod-level metrics and alerting
+- [ ] Replace manual `kubectl apply` with a GitHub Actions CI/CD pipeline
+- [ ] Explore Helm chart templating to parameterize environment-specific values
 
 ---
 
-## 📄 License
+## Author
 
-This project is open source and available under the [MIT License](LICENSE).
+**Irfan Ali** · [github.com/irfanjat](https://github.com/irfanjat) · [linkedin.com/in/irfanjat](https://linkedin.com/in/irfanjat)
